@@ -1,0 +1,50 @@
+name: Build complete regional road context
+run-name: Road context / ${{ inputs.request_id || github.run_number }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Agent request identifier
+        required: false
+      sources:
+        description: JSON array of changed source keys
+        required: true
+        default: '["central-fed-district","northwestern-fed-district","south-fed-district","north-caucasus-fed-district","volga-fed-district","ural-fed-district","siberian-fed-district","far-eastern-fed-district","belarus","crimea","east"]'
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        source: ${{ fromJSON(inputs.sources) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --user osmium 'shapely>=2,<3'
+      - name: Build full topology and settlements on the runner
+        env:
+          SOURCE: ${{ matrix.source }}
+        run: python3 server/build_context_source.py "$SOURCE"
+      - name: Install official artifact client
+        run: npm install --prefix /tmp/context-artifact @actions/artifact@2
+      - name: Upload independent region artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const {DefaultArtifactClient} = require('/tmp/context-artifact/node_modules/@actions/artifact');
+            const client = new DefaultArtifactClient();
+            const root = path.resolve('context-output');
+            const catalog = JSON.parse(fs.readFileSync(path.join(root,'roads_catalog.json')));
+            for (const region of catalog.regions.filter(r=>r.db)) {
+              await client.uploadArtifact('context-'+region.id,[path.join(root,region.id+'.sqlite3')],root,{retentionDays:1,compressionLevel:6});
+            }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: context-catalog-${{ matrix.source }}
+          path: context-output/roads_catalog.json
+          retention-days: 1
