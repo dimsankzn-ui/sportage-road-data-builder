@@ -1,5 +1,5 @@
 """Full drivable OSM topology and named settlements, independent of maxspeed."""
-import math
+import math,json
 
 HIGHWAYS = frozenset('motorway trunk primary secondary tertiary unclassified residential living_street service motorway_link trunk_link primary_link secondary_link tertiary_link road track'.split())
 PLACES = frozenset('city town village hamlet isolated_dwelling locality farm allotments'.split())
@@ -14,6 +14,8 @@ def initialize(db):
     CREATE TABLE places(id INTEGER PRIMARY KEY,osm_key TEXT UNIQUE NOT NULL,lat REAL NOT NULL,lon REAL NOT NULL,
       name TEXT NOT NULL,kind TEXT NOT NULL);
     CREATE VIRTUAL TABLE place_index USING rtree(id,min_lon,max_lon,min_lat,max_lat);
+    CREATE TABLE settlements(id INTEGER PRIMARY KEY,osm_key TEXT UNIQUE NOT NULL,lat REAL,lon REAL,name TEXT,kind TEXT,geometry TEXT NOT NULL);
+    CREATE VIRTUAL TABLE settlement_index USING rtree(id,min_lon,max_lon,min_lat,max_lat);
     ''')
 
 def drivable(tags):
@@ -39,3 +41,17 @@ def insert_place(db,key,lat,lon,tags):
     if not cursor.rowcount: return 0
     db.execute('INSERT INTO place_index VALUES(?,?,?,?,?)',(cursor.lastrowid,lon,lon,lat,lat))
     return 1
+
+def insert_boundary(db,key,tags,geom):
+    if tags.get('place') not in ('city','town','village','hamlet','isolated_dwelling'):return 0
+    name=tags.get('name:ru') or tags.get('name','')
+    if not name or not geom.is_valid or geom.is_empty:return 0
+    from shapely.geometry import mapping
+    g=geom.simplify(.000025,preserve_topology=True);coords=mapping(g)['coordinates']
+    if g.geom_type=='Polygon':coords=[coords]
+    elif g.geom_type!='MultiPolygon':return 0
+    rings=[[[[round(y,6),round(x,6)] for x,y in ring] for ring in poly] for poly in coords]
+    point=g.representative_point()
+    row=db.execute('INSERT OR IGNORE INTO settlements(osm_key,lat,lon,name,kind,geometry) VALUES(?,?,?,?,?,?)',(key,point.y,point.x,name,tags['place'],json.dumps(rings,separators=(',',':'))))
+    if not row.rowcount:return 0
+    left,bottom,right,top=g.bounds;db.execute('INSERT INTO settlement_index VALUES(?,?,?,?,?)',(row.lastrowid,left,right,bottom,top));return 1

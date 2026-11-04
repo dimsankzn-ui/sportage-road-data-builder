@@ -42,7 +42,7 @@ def road_content_hash(path):
             h.update(json.dumps(row,separators=(",",":")).encode("ascii"))
             h.update(b"\\n")
         tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for table,order in (("network","way_id,ordinal"),("places","osm_key")):
+        for table,order in (("network","way_id,ordinal"),("places","osm_key"),("settlements","osm_key")):
             if table in tables:
                 for row in db.execute("SELECT * FROM "+table+" ORDER BY "+order):
                     h.update(json.dumps(row[1:],ensure_ascii=False,separators=(",",":")).encode("utf8"))
@@ -134,12 +134,16 @@ def build(raw_geojson,source_pbf,out,countries=("BY",),region_ids=(),source_bund
             # the polygon; the renderer coalesces duplicate node/area labels.
             try:
                 from shapely import wkb
-                point=wkb.loads(bytes.fromhex(osmium.geom.WKBFactory().create_multipolygon(area))).representative_point()
+                geom=wkb.loads(bytes.fromhex(osmium.geom.WKBFactory().create_multipolygon(area)))
+                point=geom.representative_point()
             except (ValueError,RuntimeError):return
             for index in region_tree.query(point):
                 id_=active_ids[int(index)]
                 if active[id_]["prepared"].covers(point):
                     outputs[id_]["places"]+=road_context.insert_place(outputs[id_]["db"],("w" if area.from_way() else "r")+str(area.orig_id()),point.y,point.x,tags)
+            for index in region_tree.query(geom):
+                id_=active_ids[int(index)]
+                if active[id_]["prepared"].intersects(geom):road_context.insert_boundary(outputs[id_]["db"],("w" if area.from_way() else "r")+str(area.orig_id()),tags,geom)
         def node(self,node):
             tags={v.k:v.v for v in node.tags}
             if tags.get("place") not in road_context.PLACES: return
