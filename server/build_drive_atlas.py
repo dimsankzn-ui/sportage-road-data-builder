@@ -42,6 +42,15 @@ def road_content_hash(path):
             h.update(json.dumps(row,separators=(",",":")).encode("ascii"))
             h.update(b"\\n")
         tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "road_signs" in tables:
+            for row in db.execute("SELECT r.osm_id,s.forward,s.backward FROM road_signs s "
+                                  "JOIN roads r ON r.id=s.road_id ORDER BY r.osm_id"):
+                h.update(json.dumps(row,separators=(",",":")).encode("ascii"))
+                h.update(b"\n")
+        if "road_point_signs" in tables:
+            for row in db.execute("SELECT * FROM road_point_signs ORDER BY node_id"):
+                h.update(json.dumps(row,separators=(",",":")).encode("ascii"))
+                h.update(b"\n")
         for table,order in (("network","way_id,ordinal"),("places","osm_key"),("settlements","osm_key")):
             if table in tables:
                 for row in db.execute("SELECT * FROM "+table+" ORDER BY "+order):
@@ -124,9 +133,12 @@ def build(raw_geojson,source_pbf,out,countries=("BY",),region_ids=(),source_bund
         db=sqlite3.connect(path)
         road_limits.initialize(db)
         road_context.initialize(db)
+        db.execute("CREATE TABLE road_signs(road_id INTEGER PRIMARY KEY,forward INTEGER NOT NULL,backward INTEGER NOT NULL)")
+        db.execute("CREATE TABLE road_point_signs(node_id INTEGER PRIMARY KEY,way_id INTEGER NOT NULL,forward INTEGER NOT NULL,backward INTEGER NOT NULL)")
         db.execute("BEGIN")
-        outputs[id_]={"path":path,"db":db,"ways":0,"segments":0,"network":0,"places":0}
+        outputs[id_]={"path":path,"db":db,"ways":0,"segments":0,"network":0,"places":0,"pointOwners":{}}
     class Importer(osmium.SimpleHandler):
+        point_signs={}
         def area(self,area):
             tags={v.k:v.v for v in area.tags}
             if tags.get("place") not in road_context.PLACES or not (tags.get("name:ru") or tags.get("name")):return
@@ -146,6 +158,9 @@ def build(raw_geojson,source_pbf,out,countries=("BY",),region_ids=(),source_bund
                 if active[id_]["prepared"].intersects(geom):road_context.insert_boundary(outputs[id_]["db"],("w" if area.from_way() else "r")+str(area.orig_id()),tags,geom)
         def node(self,node):
             tags={v.k:v.v for v in node.tags}
+            if any(key.startswith("traffic_sign") for key in tags):
+                signs=road_limits.point_signs(tags)
+                if any(signs):self.point_signs[node.id]=signs
             if tags.get("place") not in road_context.PLACES: return
             from shapely.geometry import Point
             point=Point(node.location.lon,node.location.lat)
@@ -169,26 +184,35 @@ def build(raw_geojson,source_pbf,out,countries=("BY",),region_ids=(),source_bund
             line=LineString([(lon,lat) for lat,lon in points])
             if line.is_empty:
                 return
-            w,s,e,n=line.bounds
+            signed_nodes={ref for ref,_,_ in nodes if ref in self.point_signs}
             for region_index in region_tree.query(line):
                 id_=active_ids[int(region_index)]
                 r=active[id_]
                 if not r["prepared"].intersects(line):
                     continue
                 db=outputs[id_]["db"]
+                owners=outputs[id_]["pointOwners"]
+                for node_id in signed_nodes:
+                    if owners.setdefault(node_id,way.id)!=way.id:owners[node_id]=0
                 outputs[id_]["network"]+=road_context.insert_way(db,way.id,tags,nodes)
-                count=road_limits.insert_way(db,r["data"]["countryCode"],way.id,tags,points)
+                count=road_limits.insert_way(db,r["data"]["countryCode"],way.id,tags,points,section=True)
                 if count:
                     outputs[id_]["ways"]+=1
                     outputs[id_]["segments"]+=count
     try:
-        Importer().apply_file(str(source_pbf),locations=True,idx="sparse_file_array,"+str(root/"locations.idx"))
+        importer=Importer()
+        importer.apply_file(str(source_pbf),locations=True,idx="sparse_file_array,"+str(root/"locations.idx"))
         # Do not include wall clock time in SQLite content: unchanged roads
         # should produce the same checksums across future published snapshots.
         at="0"
         for id_,item in outputs.items():
             db=item["db"]
             db.execute("INSERT INTO metadata VALUES('network_version','1')")
+            db.execute("INSERT INTO metadata VALUES('road_rules_version','1')")
+            db.executemany("INSERT INTO road_point_signs VALUES(?,?,?,?)",
+                           ((node,way,*importer.point_signs[node]) for node,way in item["pointOwners"].items() if way))
+            signs=db.execute("SELECT COUNT(*) FROM road_signs").fetchone()[0]
+            point_signs=db.execute("SELECT COUNT(*) FROM road_point_signs").fetchone()[0]
             db.execute("INSERT INTO metadata VALUES('region_id',?)",(id_,))
             db.execute("INSERT INTO metadata VALUES('generated_at',?)",(at,))
             db.commit()
@@ -203,7 +227,8 @@ def build(raw_geojson,source_pbf,out,countries=("BY",),region_ids=(),source_bund
             metadata={"file":path.name,"bytes":path.stat().st_size,
                 "sha256":digest(path),"contentSha256":road_content_hash(path),
                 "ways":item["ways"],"segments":item["segments"],
-                "networkVersion":1,"networkSegments":item["network"],"places":item["places"]}
+                "networkVersion":1,"networkSegments":item["network"],"places":item["places"],
+                "roadRulesVersion":1,"signWays":signs,"signPoints":point_signs}
             if source_bundle:
                 if not re.fullmatch(r"ru-[a-z-]+-regions\.zip",source_bundle):
                     raise ValueError("Bad regional source bundle name")
